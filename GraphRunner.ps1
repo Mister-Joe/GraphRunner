@@ -10,6 +10,7 @@ For usage information see the wiki here: https://github.com/dafthack/GraphRunner
 To list GraphRunner modules run List-GraphRunnerModules
 "
 
+
 function Get-GraphTokens{
     <#
         .SYNOPSIS
@@ -115,18 +116,7 @@ function Get-GraphTokens{
             $tokens = Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $body
 
             if ($tokens) {
-                $tokenPayload = $tokens.access_token.Split(".")[1].Replace('-', '+').Replace('_', '/')
-                while ($tokenPayload.Length % 4) { Write-Verbose "Invalid length for a Base-64 char array or string, adding ="; $tokenPayload += "=" }
-                $tokenByteArray = [System.Convert]::FromBase64String($tokenPayload)
-                $tokenArray = [System.Text.Encoding]::ASCII.GetString($tokenByteArray)
-                $tokobj = $tokenArray | ConvertFrom-Json
-                $global:tenantid = $tokobj.tid
-                Write-Output "Decoded JWT payload:"
-                $tokobj
-                Write-Host -ForegroundColor Green '[*] Successful authentication. Access and refresh tokens have been written to the global $tokens variable. To use them with other GraphRunner modules use the Tokens flag (Example. Invoke-DumpApps -Tokens $tokens)'
-                $baseDate = Get-Date -date "01-01-1970"
-                $tokenExpire = $baseDate.AddSeconds($tokobj.exp).ToLocalTime()
-                Write-Host -ForegroundColor Yellow "[!] Your access token is set to expire on: $tokenExpire"
+                Invoke-ParseTokens -Tokens $tokens
             }
         } catch {
             $details = $_.ErrorDetails.Message | ConvertFrom-Json
@@ -136,7 +126,6 @@ function Get-GraphTokens{
         if($ExternalCall){
             return $tokens
         }
-    
     }
     else{
         If($tokens){
@@ -4879,7 +4868,166 @@ function Invoke-InviteGuest{
     }
 }
 
+function Check-FrontDoorWAF {
+    param (
+        [Parameter(Position = 0, Mandatory = $false)]
+        [object[]]$Tokens = "",
 
+        [Parameter(Mandatory = $false)]
+        [string]$OutputFile = "waf_remoteaddr_audit.txt"
+    )
+
+    # Validate token
+    if ($Tokens -and $Tokens[0].access_token) {
+        Write-Host -ForegroundColor Yellow "[*] Using the provided access tokens."
+        $AccessToken = $Tokens[0].access_token
+    }
+    else {
+        Write-Host -ForegroundColor Red "[!] No valid access token provided. Exiting..."
+        return
+    }
+
+    if ($Tokens.resource -ne "https://management.azure.com/") {
+        Write-Host -ForegroundColor Red "[!] The provided token is not scoped for the Azure Management API."
+        Write-Host -ForegroundColor Yellow "[*] You must first re-authenticate using:"
+        Write-Host -ForegroundColor Cyan "    Get-GraphTokens -resource 'https://management.azure.com/'"
+        return
+    }
+    Write-Host -ForegroundColor Yellow "[*] Using the provided management API access token."
+
+    # Fetch all subscriptions
+    try {
+        Write-Host -ForegroundColor Yellow "[*] Fetching subscriptions..."
+        $subsUri = "https://management.azure.com/subscriptions?api-version=2020-01-01"
+        $subsResult = Invoke-RestMethod -Uri $subsUri -Headers @{Authorization = "Bearer $AccessToken"}
+
+        if ($subsResult.value.Count -eq 0) {
+            Write-Host -ForegroundColor Red "[!] No subscriptions found for this token."
+            return
+        }
+    }
+    catch {
+        Write-Host -ForegroundColor Red "[!] Failed to fetch subscriptions."
+        Write-Host -ForegroundColor Yellow "    Status: $($_.Exception.Response.StatusCode.value__)"
+        return
+    }
+
+    # Clear previous results
+    $summary = @()
+    $allFindings = @()
+
+    # Loop through each subscription
+    foreach ($sub in $subsResult.value) {
+        $SubscriptionId = $sub.subscriptionId
+        Write-Host -ForegroundColor Cyan "`n[+] Scanning Subscription: $($sub.displayName) [$SubscriptionId]"
+
+        # List resource groups
+        $rgUri = "https://management.azure.com/subscriptions/${SubscriptionId}/resourcegroups?api-version=2022-09-01"
+
+        try {
+            $resourceGroups = (Invoke-RestMethod -Uri $rgUri -Headers @{Authorization = "Bearer $AccessToken"}).value
+        }
+        catch {
+            Write-Host -ForegroundColor Red "[!] Failed to list resource groups for subscription: $($sub.displayName)"
+            Write-Host -ForegroundColor Yellow "    URL: $rgUri"
+            Write-Host -ForegroundColor Yellow "    StatusCode: $($_.Exception.Response.StatusCode.value__)"
+            Write-Host -ForegroundColor Yellow "    StatusDescription: $($_.Exception.Response.StatusDescription)`n"
+            continue  # Move on to next subscription
+        }
+
+        if ($resourceGroups.count -eq 0){
+            Write-Host "No resource groups found"
+        }
+
+        foreach ($rg in $resourceGroups) {
+            $rgName = $rg.name
+
+            # List Front Door WAF policies in this RG
+            $wafUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/${rgName}/providers/Microsoft.Network/frontDoorWebApplicationFirewallPolicies?api-version=2022-05-01"
+            try {
+                $policies = (Invoke-RestMethod -Uri $wafUri -Headers @{Authorization = "Bearer $AccessToken"}).value
+            }
+            catch {
+                Write-Host -ForegroundColor Red "[!] Failed to list WAF policies in RG: $rgName (Subscription: $($sub.displayName))"
+                continue
+            }
+
+            foreach ($policy in $policies) {
+                $policyName = $policy.name
+
+                # Fetch the full WAF policy
+                $policyDetailUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$rgName/providers/Microsoft.Network/frontDoorWebApplicationFirewallPolicies/${policyName}?api-version=2022-05-01"
+                try {
+                    $policyDetail = Invoke-RestMethod -Uri $policyDetailUri -Headers @{Authorization = "Bearer $AccessToken"}
+                }
+                catch {
+                    Write-Host -ForegroundColor Red "[!] Failed to fetch details for WAF policy: $policyName in RG: $rgName"
+                    continue
+                }
+
+                $rules = $policyDetail.properties.customRules.rules
+
+                $matches = foreach ($rule in $rules) {
+                    foreach ($cond in $rule.matchConditions) {
+                        if ($cond.matchVariable -eq "RemoteAddr" -and (-not ($cond.matchVariable -eq "SocketAddr"))) {
+                            $finding = [PSCustomObject]@{
+                                Subscription   = $sub.displayName
+                                ResourceGroup  = $rgName
+                                WAFName        = $policyName
+                                RuleName       = $rule.name
+                                Operator       = $cond.operator
+                                MatchVariable  = $cond.matchVariable
+                                MatchValues    = ($cond.matchValue -join ', ')
+                            }
+                            $allFindings += $finding
+                            $finding
+                        }
+                    }
+                }
+
+                if ($matches) {
+                    Write-Host "`n[!] VULNERABLE RULES FOUND in policy [$policyName] (RG: $rgName)" -ForegroundColor Yellow
+                    $matches | Select-Object -Property ResourceGroup,WAFName,RuleName,Operator,MatchVariable,MatchValues | Format-Table -AutoSize
+                    $summary += [PSCustomObject]@{
+                        Subscription    = $sub.displayName
+                        ResourceGroup   = $rgName
+                        WAFName         = $policyName
+                        VulnerableRules = $matches.Count
+                    }
+                } else {
+                    $summary += [PSCustomObject]@{
+                        Subscription    = $sub.displayName
+                        ResourceGroup   = $rgName
+                        WAFName         = $policyName
+                        VulnerableRules = 0
+                    }
+                }
+            }
+        }
+    }
+
+    # Summary
+    Write-Host "`n----------------------------------------------------------------------`n"
+    Write-Host "`n=== Summary of WAF RemoteAddr Matches (Excluding SocketAddr Rules) ===" -ForegroundColor Cyan
+    $summary | Select-Object -Property ResourceGroup,WAFName,VulnerableRules | Format-Table -AutoSize
+
+    # Save to file
+
+    "------------- Azure Front Door WAF RemoteAddr Checks -------------`n" | Out-File $OutputFile
+
+    $uniqueSubscriptions = $summary | Select-Object -ExpandProperty Subscription -Unique
+    foreach ($sub in $uniqueSubscriptions){
+        "[*] Subscription: $sub" | Out-File -Append $OutputFile
+        "=== RemoteAddr Rule Matches (Filtered) ===" | Out-File -Append $OutputFile
+        $allFindings | Where-Object { $_.Subscription -eq $sub} | Select-Object -Property ResourceGroup,WAFName,RuleName,Operator,MatchVariable,MatchValues | Format-Table -AutoSize | Out-String | Out-File -Append $OutputFile
+        "`n=== Summary ===" | Out-File -Append $OutputFile
+        $summary | Where-Object { $_.Subscription -eq $sub} | Select-Object -Property ResourceGroup,WAFName,VulnerableRules | Format-Table -AutoSize | Out-String | Out-File -Append $OutputFile
+        "`n`n" | Out-File -Append $OutputFile
+    }
+
+    Write-Host -ForegroundColor Yellow "`nResults saved to: $OutputFile"
+    Write-Host -ForegroundColor Cyan "`nNote: to run additional modules, please re-authenticate to Graph using Get-GraphTokens`n"
+}
 
 function Invoke-GraphRecon{
 
@@ -4904,7 +5052,7 @@ function Invoke-GraphRecon{
             C:\PS> Invoke-GraphRecon -Tokens $tokens -PermissionEnum
     #>
 
-    param(
+      param(
         [Parameter(Position = 0, Mandatory = $False)]
         [object[]]
         $Tokens = "",
@@ -4942,282 +5090,216 @@ function Invoke-GraphRecon{
     if($Tokens){
         if(!$GraphRun){
             Write-Host -ForegroundColor yellow "[*] Using the provided access tokens."
-            Write-Host -ForegroundColor Yellow "[*] Refreshing token to the Azure AD Graph API..."
         }
         
-        $RefreshToken = $tokens.refresh_token
-        $authUrl = "https://login.microsoftonline.com/$tenantid"
-        $refreshbody = @{
-                "resource" = "https://graph.windows.net"
-                "client_id" =     "d3590ed6-52b3-4102-aeff-aad2292ab01c"
-                "grant_type" =    "refresh_token"
-                "refresh_token" = $RefreshToken
-                "scope"=         "user_impersonation"
-            }
-
-    try{
-    $reftokens = Invoke-RestMethod -UseBasicParsing -Method Post -Uri "$($authUrl)/oauth2/token" -Body $refreshbody
-    }
-    catch{
-    $details=$_.ErrorDetails.Message | ConvertFrom-Json
-    Write-Output $details.error
-    }
-    if($reftokens)
-            {
-               $aadtokens = $reftokens
-               $access_token = $aadtokens.access_token
-            }
+        # Use the existing tokens directly since they're already scoped to graph.microsoft.com
+        $access_token = $tokens.access_token
     }
     else{
 
-    # Login
+        # Login
         Write-Host -ForegroundColor yellow "[*] Initiating a device code login."
 
-    $body = @{
-        "client_id" =     "d3590ed6-52b3-4102-aeff-aad2292ab01c"
-        "resource" =      "https://graph.windows.net"
-    }
-    $UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36"
-    $Headers=@{}
-    $Headers["User-Agent"] = $UserAgent
-    $authResponse = Invoke-RestMethod `
-        -UseBasicParsing `
-        -Method Post `
-        -Uri "https://login.microsoftonline.com/common/oauth2/devicecode?api-version=1.0" `
-        -Headers $Headers `
-        -Body $body
-    Write-Host -ForegroundColor yellow $authResponse.Message
+        $body = @{
+            "client_id" =     "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+            "resource" =      "https://graph.microsoft.com"
+            "scope" =         "Directory.Read.All Organization.Read.All User.Read"
+        }
+        $UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36"
+        $Headers=@{}
+        $Headers["User-Agent"] = $UserAgent
+        $authResponse = Invoke-RestMethod `
+            -UseBasicParsing `
+            -Method Post `
+            -Uri "https://login.microsoftonline.com/common/oauth2/devicecode?api-version=1.0" `
+            -Headers $Headers `
+            -Body $body
+        Write-Host -ForegroundColor yellow $authResponse.Message
 
-    $continue = "authorization_pending"
-    while($continue)
-            {
+        $continue = "authorization_pending"
+        while($continue)
+        {
     
-        $body=@{
-            "client_id" =  "d3590ed6-52b3-4102-aeff-aad2292ab01c"
-            "grant_type" = "urn:ietf:params:oauth:grant-type:device_code"
-            "code" =       $authResponse.device_code
+            $body=@{
+                "client_id" =  "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+                "grant_type" = "urn:ietf:params:oauth:grant-type:device_code"
+                "code" =       $authResponse.device_code
             "scope" = "user_impersonation"
-        }
-        try{
+            }
+            try{
         $aadtokens = Invoke-RestMethod -UseBasicParsing -Method Post -Uri "https://login.microsoftonline.com/Common/oauth2/token?api-version=1.0" -Headers $Headers -Body $body
-        }
-        catch{
-        $details=$_.ErrorDetails.Message | ConvertFrom-Json
-        $continue = $details.error -eq "authorization_pending"
-        Write-Output $details.error
-        }
+            }
+            catch{
+                $details=$_.ErrorDetails.Message | ConvertFrom-Json
+                $continue = $details.error -eq "authorization_pending"
+                Write-Output $details.error
+            }
         if($aadtokens)
             {
                 Write-Host "[*] Successful auth"
                 $access_token = $aadtokens.access_token
                 break
             }
-        Start-Sleep -Seconds 3
-    }
-    }
-
-    # Generate unique GUIDs
-    $messageId = [guid]::NewGuid()
-    $trackingHeader = [guid]::NewGuid()
-    $clientId = "50afce61-c917-435b-8c6d-60aa5a8b8aa7"
-
-
-
-$soapRequest = @"
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
-  <s:Header>
-    <a:Action s:mustUnderstand="1">http://provisioning.microsoftonline.com/IProvisioningWebService/MsolConnect</a:Action>
-    <a:MessageID>urn:uuid:$messageId</a:MessageID>
-    <a:ReplyTo>
-      <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
-    </a:ReplyTo>
-    <UserIdentityHeader xmlns="http://provisioning.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <BearerToken xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">$access_token</BearerToken>
-      <LiveToken i:nil="true" xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService"/>
-    </UserIdentityHeader>
-    <ClientVersionHeader xmlns="http://provisioning.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <ClientId xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">$clientId</ClientId>
-      <Version xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">1.2.183.57</Version>
-    </ClientVersionHeader>
-    <ContractVersionHeader xmlns="http://becwebservice.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <BecVersion xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">Version47</BecVersion>
-    </ContractVersionHeader>
-    <TrackingHeader xmlns="http://becwebservice.microsoftonline.com/">$trackingHeader</TrackingHeader>
-    <a:To s:mustUnderstand="1">https://provisioningapi.microsoftonline.com/provisioningwebservice.svc</a:To>
-  </s:Header>
-  <s:Body>
-    <MsolConnect xmlns="http://provisioning.microsoftonline.com/">
-      <request xmlns:b="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-        <b:BecVersion>Version4</b:BecVersion>
-        <b:TenantId i:nil="true"/>
-        <b:VerifiedDomain i:nil="true"/>
-      </request>
-    </MsolConnect>
-  </s:Body>
-</s:Envelope>
-"@
-
-    if(!$GraphRun){
-        Write-Host -ForegroundColor yellow "[*] Now trying to query the MS provisioning API for organization settings."
-    }
-    # Send the SOAP request to the provisioningwebservice
-    $response = Invoke-WebRequest -UseBasicParsing -Uri 'https://provisioningapi.microsoftonline.com/provisioningwebservice.svc' -Method Post -ContentType 'application/soap+xml; charset=utf-8' -Body $soapRequest
-
-
-    if ($response -match '<DataBlob[^>]*>(.*?)<\/DataBlob>') {
-        $dataBlob = $Matches[1]
-    } else {
-        Write-Host "DataBlob not found in the response."
+            Start-Sleep -Seconds 3
+        }
     }
 
-    $messageID = [guid]::NewGuid()
-    $trackingHeader = [guid]::NewGuid()
-
-$GetCompanyInfoSoapRequest = @"
-<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing">
-  <s:Header>
-    <a:Action s:mustUnderstand="1">http://provisioning.microsoftonline.com/IProvisioningWebService/GetCompanyInformation</a:Action>
-    <a:MessageID>$MessageID</a:MessageID>
-    <a:ReplyTo>
-      <a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address>
-    </a:ReplyTo>
-    <UserIdentityHeader xmlns="http://provisioning.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <BearerToken xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">Bearer $access_token</BearerToken>
-      <LiveToken i:nil="true" xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService"/>
-    </UserIdentityHeader>
-    <BecContext xmlns="http://becwebservice.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <DataBlob xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">$dataBlob</DataBlob>
-      <PartitionId xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">70</PartitionId>
-    </BecContext>
-    <ClientVersionHeader xmlns="http://provisioning.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <ClientId xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">$ClientId</ClientId>
-      <Version xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">1.2.183.57</Version>
-    </ClientVersionHeader>
-    <ContractVersionHeader xmlns="http://becwebservice.microsoftonline.com/" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-      <BecVersion xmlns="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService">Version47</BecVersion>
-    </ContractVersionHeader>
-    <TrackingHeader xmlns="http://becwebservice.microsoftonline.com/">$TrackingHeader</TrackingHeader>
-    <a:To s:mustUnderstand="1">https://provisioningapi.microsoftonline.com/provisioningwebservice.svc</a:To>
-  </s:Header>
-  <s:Body>
-    <GetCompanyInformation xmlns="http://provisioning.microsoftonline.com/">
-      <request xmlns:b="http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-        <b:BecVersion>Version16</b:BecVersion>
-        <b:TenantId i:nil="true"/>
-        <b:VerifiedDomain i:nil="true"/>
-      </request>
-    </GetCompanyInformation>
-  </s:Body>
-</s:Envelope>
-"@
-
-    $companyinfo = Invoke-WebRequest -UseBasicParsing -Uri 'https://provisioningapi.microsoftonline.com/provisioningwebservice.svc' -Method Post -ContentType 'application/soap+xml; charset=utf-8' -Body $GetCompanyInfoSoapRequest
-
-
-    $xml = [xml]$companyInfo
-
-    # Define namespaces
-    $ns = New-Object Xml.XmlNamespaceManager($xml.NameTable)
-    $ns.AddNamespace("s", "http://www.w3.org/2003/05/soap-envelope")
-    $ns.AddNamespace("b", "http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration.WebService")
-    $ns.AddNamespace("c", "http://schemas.datacontract.org/2004/07/Microsoft.Online.Administration")
-    $ns.AddNamespace("d", "http://schemas.microsoft.com/2003/10/Serialization/Arrays")
-    $ns.AddNamespace("ns", "http://schemas.microsoft.com/online/serviceextensions/2009/08/ExtensibilitySchema.xsd")
-
-
-    # Extract data using XPath
-    $displayName = $xml.SelectSingleNode("//c:DisplayName", $ns).InnerText
-    $street = $xml.SelectSingleNode("//c:Street", $ns).InnerText
-    $city = $xml.SelectSingleNode("//c:City", $ns).InnerText
-    $state = $xml.SelectSingleNode("//c:State", $ns).InnerText
-    $postalCode = $xml.SelectSingleNode("//c:PostalCode", $ns).InnerText
-    $Country = $xml.SelectSingleNode("//c:CountryLetterCode", $ns).InnerText
-    $TechnicalContact = $xml.SelectSingleNode("//c:TechnicalNotificationEmails", $ns).InnerText
-    $Telephone = $xml.SelectSingleNode("//c:TelephoneNumber", $ns).InnerText
-    $InitialDomain = $xml.SelectSingleNode("//c:InitialDomain", $ns).InnerText
-    $DirSync = $xml.SelectSingleNode("//c:DirectorySynchronizationEnabled", $ns).InnerText
-    $DirSyncStatus = $xml.SelectSingleNode("//c:DirectorySynchronizationStatus", $ns).InnerText
-    $DirSyncClientMachine = $xml.SelectSingleNode("//c:DirSyncClientMachineName", $ns).InnerText
-    $DirSyncServiceAccount = $xml.SelectSingleNode("//c:DirSyncServiceAccount", $ns).InnerText
-    $PasswordSync = $xml.SelectSingleNode("//c:PasswordSynchronizationEnabled", $ns).InnerText
-    $PasswordReset = $xml.SelectSingleNode("//c:SelfServePasswordResetEnabled", $ns).InnerText
-    $UsersPermToConsent = $xml.SelectSingleNode("//c:UsersPermissionToUserConsentToAppEnabled", $ns).InnerText
-    $UsersPermToReadUsers = $xml.SelectSingleNode("//c:UsersPermissionToReadOtherUsersEnabled", $ns).InnerText
-    $UsersPermToCreateLOBApps = $xml.SelectSingleNode("//c:UsersPermissionToCreateLOBAppsEnabled", $ns).InnerText
-    $UsersPermToCreateGroups = $xml.SelectSingleNode("//c:UsersPermissionToCreateGroupsEnabled", $ns).InnerText
-
-    if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    Write-Host -ForegroundColor Yellow "Main Contact Info"
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
+    # --- Microsoft Graph API Organization Recon ---
+    $headers = @{
+        "Authorization" = "Bearer $access_token"
+        "Content-Type" = "application/json"
     }
-    # Display the extracted data
-    Write-Output "Display Name: $displayName"
-    Write-Output "Street: $street"
-    Write-Output "City: $city"
-    Write-Output "State: $state"
-    Write-Output "Postal Code: $postalCode"
-    Write-Output "Country: $country"
-    Write-Output "Technical Notification Email: $TechnicalContact"
-    Write-Output "Telephone Number: $Telephone"
-    if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    Write-Host -ForegroundColor Yellow "Directory Sync Settings"
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    }
-    Write-Output "Initial Domain: $initialDomain"
-    Write-Output "Directory Sync Enabled: $dirSync"
-    Write-Output "Directory Sync Status: $dirSyncStatus"
-    Write-Output "Directory Sync Client Machine: $dirSyncClientMachine"
-    Write-Output "Directory Sync Service Account: $dirSyncServiceAccount"
-    Write-Output "Password Sync Enabled: $passwordSync"
-    if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    Write-Host -ForegroundColor Yellow "User Settings"
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    }
-    Write-Output "Self-Service Password Reset Enabled: $passwordReset"
-    Write-Output "Users Can Consent to Apps: $UsersPermToConsent"
-    Write-Output "Users Can Read Other Users: $UsersPermToReadUsers"
-    Write-Output "Users Can Create Apps: $UsersPermToCreateLOBApps"
-    Write-Output "Users Can Create Groups: $UsersPermToCreateGroups"
 
+    try {
+        # Get current user information first to test authentication
+        $me = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/me" -Headers $headers -Method Get
+        
+        # Try to get organization info - this might fail due to permissions
+        try {
+            $org = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/organization" -Headers $headers -Method Get
+            $org = $org.value[0]
+            
+            if(!$GraphRun){
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+                Write-Host -ForegroundColor Yellow "Main Contact Info"
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+            }
+            Write-Output "Display Name: $($org.displayName)"
+            Write-Output "Street: $($org.street)"
+            Write-Output "City: $($org.city)"
+            Write-Output "State: $($org.state)"
+            Write-Output "Postal Code: $($org.postalCode)"
+            Write-Output "Country: $($org.country)"
+            Write-Output "Technical Notification Email: $($org.technicalNotificationMails)"
+            Write-Output "Telephone Number: $($org.telephoneNumber)"
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Organization endpoint not accessible, trying alternative methods..."
+            
+            # Try to get tenant info from user's context
+            $tenantId = $me.userPrincipalName.Split('@')[1]
+            Write-Output "Tenant Domain: $tenantId"
+            Write-Output "User Principal Name: $($me.userPrincipalName)"
+            Write-Output "Display Name: $($me.displayName)"
+        }
+        
+        # Try to get domains information
+        try {
+            $domains = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/domains" -Headers $headers -Method Get
+            $initialDomain = $domains.value | Where-Object { $_.isInitial } | Select-Object -First 1 -ExpandProperty id
+            
+            if(!$GraphRun){
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+                Write-Host -ForegroundColor Yellow "Directory Sync Settings"
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+            }
+            Write-Output "Initial Domain: $initialDomain"
+            
+            # Get directory sync information from organization
+            $syncEnabled = $null
+            $syncStatus = $null
+            
+            if ($org) {
+                $syncEnabled = $org.onPremisesSyncEnabled
+                $syncStatus = $org.onPremisesDirectorySynchronizationEnabled
+            }
+            
+            # If organization endpoint didn't provide sync info, try alternative
+            if ($syncEnabled -eq $null) {
+                try {
+                    $onPremSync = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/organization?`$select=onPremisesSyncEnabled,onPremisesDirectorySynchronizationEnabled" -Headers $headers -Method Get
+                    if ($onPremSync.value) {
+                        $orgSync = $onPremSync.value[0]
+                        $syncEnabled = $orgSync.onPremisesSyncEnabled
+                        $syncStatus = $orgSync.onPremisesDirectorySynchronizationEnabled
+                    }
+                } catch {
+                    # Continue with user-based detection
+                }
+            }
+            
+            # Display sync information
+            if ($syncEnabled -ne $null) {
+                Write-Output "Directory Sync Enabled: $syncEnabled"
+            }
+            if ($syncStatus -ne $null) {
+                Write-Output "Directory Sync Status: $syncStatus"
+            }
+            
+            # Check for actual synced users to verify sync status
+            try {
+                $users = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users?`$top=10&`$select=onPremisesSyncEnabled,onPremisesDomainName,onPremisesSamAccountName" -Headers $headers -Method Get
+                $syncedUsers = $users.value | Where-Object { $_.onPremisesSyncEnabled -eq $true }
+                if ($syncedUsers.Count -gt 0) {
+                    Write-Output "Directory Sync Active: Yes (found $($syncedUsers.Count) synced users)"
+                    Write-Output "Sample Synced User Domain: $($syncedUsers[0].onPremisesDomainName)"
+                } else {
+                    Write-Output "Directory Sync Active: No (no synced users found)"
+                }
+            } catch {
+                Write-Output "Directory Sync Active: Unable to determine"
+            }
+            
+            # Try to get additional sync details from beta endpoint
+            try {
+                $dirSyncStatus = Invoke-RestMethod -Uri "https://graph.microsoft.com/beta/directorySync" -Headers $headers -Method Get
+                if ($dirSyncStatus.lastSyncDateTime) {
+                    Write-Output "Directory Sync Last Sync: $($dirSyncStatus.lastSyncDateTime)"
+                }
+                if ($dirSyncStatus.status) {
+                    Write-Output "Directory Sync Detailed Status: $($dirSyncStatus.status)"
+                }
+            } catch {
+                # Beta endpoint not available, skip
+            }
+            
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Domains endpoint not accessible"
+        }
+        
+        # Try to get authorization policy for user permissions
+        try {
+            $authpolicy = Invoke-RestMethod -Uri "https://graph.microsoft.com/beta/policies/authorizationPolicy" -Headers $headers -Method Get
+            $authpolicy = $authpolicy.value[0]
+            
+            if(!$GraphRun){
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+                Write-Host -ForegroundColor Yellow "User Settings"
+                Write-Host -ForegroundColor Yellow ("=" * 80) 
+            }
+            Write-Output "Users Can Consent to Apps: $($authpolicy.defaultUserRolePermissions.allowedToCreateApps)"
+            Write-Output "Users Can Read Other Users: $($authpolicy.defaultUserRolePermissions.allowedToReadOtherUsers)"
+            Write-Output "Users Can Create Apps: $($authpolicy.defaultUserRolePermissions.allowedToCreateApps)"
+            Write-Output "Users Can Create Groups: $($authpolicy.defaultUserRolePermissions.allowedToCreateSecurityGroups)"
+        } catch {
+            Write-Host -ForegroundColor Yellow "[*] Authorization policy endpoint not accessible"
+        }
+        
+        if(!$GraphRun){
+            Write-Host -ForegroundColor Yellow ("=" * 80) 
+        }
+    } catch {
+        Write-Host -ForegroundColor Red "Error with Microsoft Graph API calls: $_"
+        Write-Host -ForegroundColor Yellow "[*] This might be due to insufficient permissions or token scope issues"
+    }
 
-    # Select the ServiceParameter nodes
-    $serviceParameters = $xml.SelectNodes("//ns:ServiceParameter", $ns)
-    if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    Write-Host -ForegroundColor Yellow "Additional Service Parameters"
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    }
-    # Loop through each ServiceParameter node and extract the Name and Value
-    foreach ($parameter in $serviceParameters) {
-        $name = $parameter.Name
-        $value = $parameter.Value
-        Write-Output "$name : $value"
-    }
-    if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
-    }
+    # Variables needed for permission enumeration
     $accesstoken = $tokens.access_token
     $refreshtoken = $tokens.refresh_token
         
     $graphApiEndpoint = "https://graph.microsoft.com/v1.0/me"
     $estimateAccessEndpoint = "https://graph.microsoft.com/beta/roleManagement/directory/estimateAccess"
-    $authpolicyEndpoint = "https://graph.microsoft.com/beta/policies/authorizationPolicy "
+    $authpolicyEndpoint = "https://graph.microsoft.com/beta/policies/authorizationPolicy"
 
     $headers = @{
-        "Authorization" = "Bearer $accessToken"
+        "Authorization" = "Bearer $access_token"
         "Content-Type" = "application/json"
     }
-    
-
 
     try {
         $authpolicy = Invoke-RestMethod -Uri $authpolicyEndpoint -Headers $headers -Method Get
         if(!$GraphRun){
         Write-Host -ForegroundColor Yellow "Authorization Policy Info"
-        Write-Host -ForegroundColor Yellow ("=" * 80) 
+            Write-Host -ForegroundColor Yellow ("=" * 80) 
         }
         # Display the extracted data
         Write-Output ("Allowed to create app registrations (Default User Role Permissions): " + $authpolicy.value.defaultUserRolePermissions.allowedToCreateApps)
@@ -5243,7 +5325,7 @@ $GetCompanyInfoSoapRequest = @"
 
 
     if(!$GraphRun){
-    Write-Host -ForegroundColor Yellow ("=" * 80) 
+        Write-Host -ForegroundColor Yellow ("=" * 80) 
     }
 
     if($PermissionEnum){
@@ -5638,7 +5720,7 @@ $GetCompanyInfoSoapRequest = @"
             }
 
             # Split resource actions into batches of 20
-            $batchSize = 20
+             $batchSize = 20
             $batchCount = [math]::Ceiling($resourceActions.Count / $batchSize)
 
             # Create arrays to separate "Allowed" and other access types
@@ -5705,6 +5787,7 @@ $GetCompanyInfoSoapRequest = @"
     
     }
 }
+
 
 function Invoke-SearchUserAttributes {
     <#
@@ -7576,121 +7659,6 @@ function Invoke-ForgeUserAgent
         return $UserAgent
    }   
 }
-function Invoke-BruteClientIDAccess {
-
-    [cmdletbinding()]
-    Param([Parameter(Mandatory=$true)]
-    [string]$domain,
-    [Parameter(Mandatory=$false)]
-    [string]$Resource = "https://graph.microsoft.com/",
-    [Parameter(Mandatory=$true)]
-    [string]$refreshToken,
-    [Parameter(Mandatory=$False)]
-    [ValidateSet('Mac','Windows','AndroidMobile','iPhone')]
-    [String]$Device,
-    [Parameter(Mandatory=$False)]
-    [ValidateSet('Android','IE','Chrome','Firefox','Edge','Safari')]
-    [String]$Browser,
-    [Parameter(Mandatory=$False)]
-    [ValidateSet('Yellow','Red','DarkGreen','DarkRed')]
-    [String]$OutputColor = "White"
-    )
-    if ($Device) {
-		if ($Browser) {
-			$UserAgent = Invoke-ForgeUserAgent -Device $Device -Browser $Browser
-		}
-		else {
-			$UserAgent = Invoke-ForgeUserAgent -Device $Device
-		}
-	}
-	else {
-	   if ($Browser) {
-			$UserAgent = Invoke-ForgeUserAgent -Browser $Browser 
-	   } 
-	   else {
-			$UserAgent = Invoke-ForgeUserAgent
-	   }
-	}
-    $AppInfo = @(
-        [pscustomobject]@{ClientID='00b41c95-dab0-4487-9791-b9d2c32c80f2'; App='Office 365 Management'}
-        [pscustomobject]@{ClientID='04b07795-8ddb-461a-bbee-02f9e1bf7b46'; App='Microsoft Azure CLI'}
-        [pscustomobject]@{ClientID='0ec893e0-5785-4de6-99da-4ed124e5296c'; App='Office UWP PWA'}
-        [pscustomobject]@{ClientID='18fbca16-2224-45f6-85b0-f7bf2b39b3f3'; App='Microsoft Docs'}
-        [pscustomobject]@{ClientID='1950a258-227b-4e31-a9cf-717495945fc2'; App='Microsoft Azure PowerShell'}
-        [pscustomobject]@{ClientID='1b3c667f-cde3-4090-b60b-3d2abd0117f0'; App='Windows Spotlight'}
-        [pscustomobject]@{ClientID='1b730954-1685-4b74-9bfd-dac224a7b894'; App='Azure Active Directory PowerShell'}
-        [pscustomobject]@{ClientID='1fec8e78-bce4-4aaf-ab1b-5451cc387264'; App='Microsoft Teams'}
-        [pscustomobject]@{ClientID='22098786-6e16-43cc-a27d-191a01a1e3b5'; App='Microsoft To-Do client'}
-        [pscustomobject]@{ClientID='268761a2-03f3-40df-8a8b-c3db24145b6b'; App='Universal Store Native Client'}
-        [pscustomobject]@{ClientID='26a7ee05-5602-4d76-a7ba-eae8b7b67941'; App='Windows Search'}
-        [pscustomobject]@{ClientID='27922004-5251-4030-b22d-91ecd9a37ea4'; App='Outlook Mobile'}
-        [pscustomobject]@{ClientID='29d9ed98-a469-4536-ade2-f981bc1d605e'; App='Microsoft Authentication Broker'}
-        [pscustomobject]@{ClientID='2d7f3606-b07d-41d1-b9d2-0d0c9296a6e8'; App='Microsoft Bing Search for Microsoft Edge'}
-        [pscustomobject]@{ClientID='4813382a-8fa7-425e-ab75-3b753aab3abb'; App='Microsoft Authenticator App '}
-        [pscustomobject]@{ClientID='4e291c71-d680-4d0e-9640-0a3358e31177'; App='PowerApps'}
-        [pscustomobject]@{ClientID='57336123-6e14-4acc-8dcf-287b6088aa28'; App='Microsoft Whiteboard Client'}
-        [pscustomobject]@{ClientID='57fcbcfa-7cee-4eb1-8b25-12d2030b4ee0'; App='Microsoft Flow Mobile PROD-GCCH-CN'}
-        [pscustomobject]@{ClientID='60c8bde5-3167-4f92-8fdb-059f6176dc0f'; App='Enterprise Roaming and Backup'}
-        [pscustomobject]@{ClientID='66375f6b-983f-4c2c-9701-d680650f588f'; App='Microsoft Planner'}
-        [pscustomobject]@{ClientID='844cca35-0656-46ce-b636-13f48b0eecbd'; App='Microsoft Stream Mobile Native'}
-        [pscustomobject]@{ClientID='872cd9fa-d31f-45e0-9eab-6e460a02d1f1'; App='Visual Studio - Legacy'}
-        [pscustomobject]@{ClientID='87749df4-7ccf-48f8-aa87-704bad0e0e16'; App='Microsoft Teams - Device Admin Agent'}
-        [pscustomobject]@{ClientID='90f610bf-206d-4950-b61d-37fa6fd1b224'; App='Aadrm Admin PowerShell'}
-        [pscustomobject]@{ClientID='9ba1a5c7-f17a-4de9-a1f1-6178c8d51223'; App='Microsfot Intune Company Portal'}
-        [pscustomobject]@{ClientID='9bc3ab49-b65d-410a-85ad-de819febfddc'; App='Microsoft SharePoint Online Management Shell'}
-        [pscustomobject]@{ClientID='a0c73c16-a7e3-4564-9a95-2bdf47383716'; App='Microsoft Exchange Online Remote PowerShell'}
-        [pscustomobject]@{ClientID='a40d7d7d-59aa-447e-a655-679a4107e548'; App='Accounts Control UI'}
-        [pscustomobject]@{ClientID='a569458c-7f2b-45cb-bab9-b7dee514d112'; App='Yammer iPhone'}
-        [pscustomobject]@{ClientID='ab9b8c07-8f02-4f72-87fa-80105867a763'; App='OneDrive Sync Engine '}
-        [pscustomobject]@{ClientID='af124e86-4e96-495a-b70a-90f90ab96707'; App='OneDrive iOS App'}
-        [pscustomobject]@{ClientID='b26aadf8-566f-4478-926f-589f601d9c74'; App='OneDrive'}
-        [pscustomobject]@{ClientID='b90d5b8f-5503-4153-b545-b31cecfaece2'; App='AADJ CSP '}
-        [pscustomobject]@{ClientID='c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12'; App='Microsoft Power BI'}
-        [pscustomobject]@{ClientID='c58637bb-e2e1-4312-8a00-04b5ffcd3403'; App='SharePoint Online Client Extensibility'}
-        [pscustomobject]@{ClientID='cb1056e2-e479-49de-ae31-7812af012ed8'; App='Microsoft Azure Active Directory Connect'}
-        [pscustomobject]@{ClientID='cf36b471-5b44-428c-9ce7-313bf84528de'; App='Microsoft Bing Search'}
-        [pscustomobject]@{ClientID='d326c1ce-6cc6-4de2-bebc-4591e5e13ef0'; App='SharePoint'}
-        [pscustomobject]@{ClientID='d3590ed6-52b3-4102-aeff-aad2292ab01c'; App='Microsoft Office'}
-        [pscustomobject]@{ClientID='e9b154d0-7658-433b-bb25-6b8e0a8a7c59'; App='Outlook Lite'}
-        [pscustomobject]@{ClientID='e9c51622-460d-4d3d-952d-966a5b1da34c'; App='Microsoft Edge'}
-        [pscustomobject]@{ClientID='eb539595-3fe1-474e-9c1d-feb3625d1be5'; App='Microsoft Tunnel'}
-        [pscustomobject]@{ClientID='ecd6b820-32c2-49b6-98a6-444530e5a77a'; App='Microsoft Edge'}
-        [pscustomobject]@{ClientID='f05ff7c9-f75a-4acd-a3b5-f4b6a870245d'; App='SharePoint Android'}
-        [pscustomobject]@{ClientID='f448d7e5-e313-4f90-a3eb-5dbb3277e4b3'; App='Media Recording for Dynamics 365 Sales'}
-        [pscustomobject]@{ClientID='f44b1140-bc5e-48c6-8dc0-5cf5a53c0e34'; App='Microsoft Edge'}
-        [pscustomobject]@{ClientID='fb78d390-0c51-40cd-8e17-fdbfab77341b'; App='Microsoft Exchange REST API Based PowerShell'}
-        [pscustomobject]@{ClientID='fc0f3af4-6835-4174-b806-f7db311fd2f3'; App='Microsoft Intune Windows Agent'}
-        )
-        $AppInfo | % {
-        $Headers=@{}
-        $Headers["User-Agent"] = $UserAgent
-        $TenantId = Get-TenantID -domain $domain
-        $authUrl = "https://login.microsoftonline.com/$($TenantId)"
-        $body = @{
-            "resource" =      $Resource
-            "client_id" =     $_.ClientID
-            "grant_type" =    "refresh_token"
-            "refresh_token" = $refreshToken
-            "scope" = "openid"
-        }
-        $ErrorActionPreference = "SilentlyContinue"
-        $global:CustomToken = Invoke-RestMethod -UseBasicParsing -Method Post -Uri "$($authUrl)/oauth2/token" -Headers $Headers -Body $body
-        Write-Host -ForegroundColor $OutputColor "App: $($_.App) ClientID: $($_.ClientID) has scope of: $($CustomToken.scope)"
-    }
-}
-
-function Invoke-ImportTokens {
-    [cmdletbinding()]
-    Param([Parameter(Mandatory=$false)]
-    [String]$AccessToken,
-    [Parameter(Mandatory=$false)]
-    [String]$RefreshToken
-    )
-    $global:tokens = $null
-    $global:tokens = @(
-        [pscustomobject]@{access_token=$AccessToken;refresh_token=$RefreshToken}
-    )
-}
 
 function Invoke-AuthorizationCodeFlow {
     # initial token will be for Azure CLI client
@@ -7819,81 +7787,195 @@ function Start-LocalHttpListener {
     return $listener, $port
 }
 
-function List-GraphRunnerModules{
+function Invoke-BruteClientIDAccess {
+
+    [cmdletbinding()]
+    Param([Parameter(Mandatory=$true)]
+    [string]$domain,
+    [Parameter(Mandatory=$false)]
+    [string]$Resource = "https://graph.microsoft.com/",
+    [Parameter(Mandatory=$true)]
+    [string]$refreshToken,
+    [Parameter(Mandatory=$False)]
+    [ValidateSet('Mac','Windows','AndroidMobile','iPhone')]
+    [String]$Device,
+    [Parameter(Mandatory=$False)]
+    [ValidateSet('Android','IE','Chrome','Firefox','Edge','Safari')]
+    [String]$Browser,
+    [Parameter(Mandatory=$False)]
+    [ValidateSet('Yellow','Red','DarkGreen','DarkRed')]
+    [String]$OutputColor = "White"
+    )
+    if ($Device) {
+		if ($Browser) {
+			$UserAgent = Invoke-ForgeUserAgent -Device $Device -Browser $Browser
+		}
+		else {
+			$UserAgent = Invoke-ForgeUserAgent -Device $Device
+		}
+	}
+	else {
+	   if ($Browser) {
+			$UserAgent = Invoke-ForgeUserAgent -Browser $Browser 
+	   } 
+	   else {
+			$UserAgent = Invoke-ForgeUserAgent
+	   }
+	}
+    $AppInfo = @(
+        [pscustomobject]@{ClientID='00b41c95-dab0-4487-9791-b9d2c32c80f2'; App='Office 365 Management'}
+        [pscustomobject]@{ClientID='04b07795-8ddb-461a-bbee-02f9e1bf7b46'; App='Microsoft Azure CLI'}
+        [pscustomobject]@{ClientID='0ec893e0-5785-4de6-99da-4ed124e5296c'; App='Office UWP PWA'}
+        [pscustomobject]@{ClientID='18fbca16-2224-45f6-85b0-f7bf2b39b3f3'; App='Microsoft Docs'}
+        [pscustomobject]@{ClientID='1950a258-227b-4e31-a9cf-717495945fc2'; App='Microsoft Azure PowerShell'}
+        [pscustomobject]@{ClientID='1b3c667f-cde3-4090-b60b-3d2abd0117f0'; App='Windows Spotlight'}
+        [pscustomobject]@{ClientID='1b730954-1685-4b74-9bfd-dac224a7b894'; App='Azure Active Directory PowerShell'}
+        [pscustomobject]@{ClientID='1fec8e78-bce4-4aaf-ab1b-5451cc387264'; App='Microsoft Teams'}
+        [pscustomobject]@{ClientID='22098786-6e16-43cc-a27d-191a01a1e3b5'; App='Microsoft To-Do client'}
+        [pscustomobject]@{ClientID='268761a2-03f3-40df-8a8b-c3db24145b6b'; App='Universal Store Native Client'}
+        [pscustomobject]@{ClientID='26a7ee05-5602-4d76-a7ba-eae8b7b67941'; App='Windows Search'}
+        [pscustomobject]@{ClientID='27922004-5251-4030-b22d-91ecd9a37ea4'; App='Outlook Mobile'}
+        [pscustomobject]@{ClientID='29d9ed98-a469-4536-ade2-f981bc1d605e'; App='Microsoft Authentication Broker'}
+        [pscustomobject]@{ClientID='2d7f3606-b07d-41d1-b9d2-0d0c9296a6e8'; App='Microsoft Bing Search for Microsoft Edge'}
+        [pscustomobject]@{ClientID='4813382a-8fa7-425e-ab75-3b753aab3abb'; App='Microsoft Authenticator App '}
+        [pscustomobject]@{ClientID='4e291c71-d680-4d0e-9640-0a3358e31177'; App='PowerApps'}
+        [pscustomobject]@{ClientID='57336123-6e14-4acc-8dcf-287b6088aa28'; App='Microsoft Whiteboard Client'}
+        [pscustomobject]@{ClientID='57fcbcfa-7cee-4eb1-8b25-12d2030b4ee0'; App='Microsoft Flow Mobile PROD-GCCH-CN'}
+        [pscustomobject]@{ClientID='60c8bde5-3167-4f92-8fdb-059f6176dc0f'; App='Enterprise Roaming and Backup'}
+        [pscustomobject]@{ClientID='66375f6b-983f-4c2c-9701-d680650f588f'; App='Microsoft Planner'}
+        [pscustomobject]@{ClientID='844cca35-0656-46ce-b636-13f48b0eecbd'; App='Microsoft Stream Mobile Native'}
+        [pscustomobject]@{ClientID='872cd9fa-d31f-45e0-9eab-6e460a02d1f1'; App='Visual Studio - Legacy'}
+        [pscustomobject]@{ClientID='87749df4-7ccf-48f8-aa87-704bad0e0e16'; App='Microsoft Teams - Device Admin Agent'}
+        [pscustomobject]@{ClientID='90f610bf-206d-4950-b61d-37fa6fd1b224'; App='Aadrm Admin PowerShell'}
+        [pscustomobject]@{ClientID='9ba1a5c7-f17a-4de9-a1f1-6178c8d51223'; App='Microsfot Intune Company Portal'}
+        [pscustomobject]@{ClientID='9bc3ab49-b65d-410a-85ad-de819febfddc'; App='Microsoft SharePoint Online Management Shell'}
+        [pscustomobject]@{ClientID='a0c73c16-a7e3-4564-9a95-2bdf47383716'; App='Microsoft Exchange Online Remote PowerShell'}
+        [pscustomobject]@{ClientID='a40d7d7d-59aa-447e-a655-679a4107e548'; App='Accounts Control UI'}
+        [pscustomobject]@{ClientID='a569458c-7f2b-45cb-bab9-b7dee514d112'; App='Yammer iPhone'}
+        [pscustomobject]@{ClientID='ab9b8c07-8f02-4f72-87fa-80105867a763'; App='OneDrive Sync Engine '}
+        [pscustomobject]@{ClientID='af124e86-4e96-495a-b70a-90f90ab96707'; App='OneDrive iOS App'}
+        [pscustomobject]@{ClientID='b26aadf8-566f-4478-926f-589f601d9c74'; App='OneDrive'}
+        [pscustomobject]@{ClientID='b90d5b8f-5503-4153-b545-b31cecfaece2'; App='AADJ CSP '}
+        [pscustomobject]@{ClientID='c0d2a505-13b8-4ae0-aa9e-cddd5eab0b12'; App='Microsoft Power BI'}
+        [pscustomobject]@{ClientID='c58637bb-e2e1-4312-8a00-04b5ffcd3403'; App='SharePoint Online Client Extensibility'}
+        [pscustomobject]@{ClientID='cb1056e2-e479-49de-ae31-7812af012ed8'; App='Microsoft Azure Active Directory Connect'}
+        [pscustomobject]@{ClientID='cf36b471-5b44-428c-9ce7-313bf84528de'; App='Microsoft Bing Search'}
+        [pscustomobject]@{ClientID='d326c1ce-6cc6-4de2-bebc-4591e5e13ef0'; App='SharePoint'}
+        [pscustomobject]@{ClientID='d3590ed6-52b3-4102-aeff-aad2292ab01c'; App='Microsoft Office'}
+        [pscustomobject]@{ClientID='e9b154d0-7658-433b-bb25-6b8e0a8a7c59'; App='Outlook Lite'}
+        [pscustomobject]@{ClientID='e9c51622-460d-4d3d-952d-966a5b1da34c'; App='Microsoft Edge'}
+        [pscustomobject]@{ClientID='eb539595-3fe1-474e-9c1d-feb3625d1be5'; App='Microsoft Tunnel'}
+        [pscustomobject]@{ClientID='ecd6b820-32c2-49b6-98a6-444530e5a77a'; App='Microsoft Edge'}
+        [pscustomobject]@{ClientID='f05ff7c9-f75a-4acd-a3b5-f4b6a870245d'; App='SharePoint Android'}
+        [pscustomobject]@{ClientID='f448d7e5-e313-4f90-a3eb-5dbb3277e4b3'; App='Media Recording for Dynamics 365 Sales'}
+        [pscustomobject]@{ClientID='f44b1140-bc5e-48c6-8dc0-5cf5a53c0e34'; App='Microsoft Edge'}
+        [pscustomobject]@{ClientID='fb78d390-0c51-40cd-8e17-fdbfab77341b'; App='Microsoft Exchange REST API Based PowerShell'}
+        [pscustomobject]@{ClientID='fc0f3af4-6835-4174-b806-f7db311fd2f3'; App='Microsoft Intune Windows Agent'}
+        )
+        $AppInfo | % {
+        $Headers=@{}
+        $Headers["User-Agent"] = $UserAgent
+        $TenantId = Get-TenantID -domain $domain
+        $authUrl = "https://login.microsoftonline.com/$($TenantId)"
+        $body = @{
+            "resource" =      $Resource
+            "client_id" =     $_.ClientID
+            "grant_type" =    "refresh_token"
+            "refresh_token" = $refreshToken
+            "scope" = "openid"
+        }
+        $ErrorActionPreference = "SilentlyContinue"
+        $global:CustomToken = Invoke-RestMethod -UseBasicParsing -Method Post -Uri "$($authUrl)/oauth2/token" -Headers $Headers -Body $body
+        Write-Host -ForegroundColor $OutputColor "App: $($_.App) ClientID: $($_.ClientID) has scope of: $($CustomToken.scope)"
+    }
+}
+function Invoke-ImportTokens {
+    [cmdletbinding()]
+    Param([Parameter(Mandatory=$false)]
+    [String]$AccessToken,
+    [Parameter(Mandatory=$false)]
+    [String]$RefreshToken
+    )
+    $global:tokens = $null
+    $global:tokens = @(
+        [pscustomobject]@{access_token=$AccessToken;refresh_token=$RefreshToken}
+    )
+}
+function List-GraphRunnerModules {
     <#
     .SYNOPSIS 
     A module to list all of the GraphRunner modules
     #>
 
-    Write-Host -foregroundcolor green "[*] Listing GraphRunner modules..."
+    Write-Host -ForegroundColor Green "[*] Listing GraphRunner modules..."
 
-    Write-Host -ForegroundColor green "-------------------- Authentication Modules -------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Get-GraphTokens`t`t`t-`t Authenticate as a user to Microsoft Graph
-Invoke-RefreshGraphTokens`t-`t Use a refresh token to obtain new access tokens
-Get-AzureAppTokens`t`t-`t Complete OAuth flow as an app to obtain access tokens
-Invoke-RefreshAzureAppTokens`t-`t Use a refresh token and app credentials to refresh a token
-Invoke-AutoTokenRefresh`t-`t Refresh tokens at an interval.
-    "
-    Write-Host -ForegroundColor green "----------------- Recon & Enumeration Modules -----------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Invoke-GraphRecon`t`t-`t Performs general recon for org info, user settings, directory sync settings, etc
-Invoke-DumpCAPS`t`t`t-`t Gets conditional access policies
-Invoke-DumpApps`t`t`t-`t Gets app registrations and external enterprise apps along with consent and scope info
-Get-AzureADUsers`t`t-`t Gets user directory
-Get-SecurityGroups`t`t-`t Gets security groups and members
-Get-UpdatableGroups`t`t-`t Gets groups that may be able to be modified by the current user
-Get-DynamicGroups`t`t-`t Finds dynamic groups and displays membership rules
-Get-SharePointSiteURLs`t`t-`t Gets a list of SharePoint site URLs visible to the current user
-Invoke-GraphOpenInboxFinder`t-`t Checks each user’s inbox in a list to see if they are readable
-Get-TenantID`t`t`t-`t Retreives the tenant GUID from the domain name
-    "
-    Write-Host -ForegroundColor green "--------------------- Persistence Modules ---------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Invoke-InjectOAuthApp`t`t-`t Injects an app registration into the tenant
-Invoke-SecurityGroupCloner`t-`t Clones a security group while using an identical name and member list but can inject another user as well
-Invoke-InviteGuest`t`t-`t Invites a guest user to the tenant
-Invoke-AddGroupMember`t`t-`t Adds a member to a group
-    "
-    Write-Host -ForegroundColor green "----------------------- Pillage Modules -----------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Invoke-SearchSharePointAndOneDrive -`t Search across all SharePoint sites and OneDrive drives visible to the user
-Invoke-ImmersiveFileReader`t-`t Open restricted files with the immersive reader
-Invoke-SearchMailbox`t`t-`t Has the ability to do deep searches across a user’s mailbox and can export messages
-Invoke-SearchTeams`t`t-`t Can search all Teams messages in all channels that are readable by the current user.
-Invoke-SearchUserAttributes`t-`t Search for terms across all user attributes in a directory
-Get-Inbox`t`t`t-`t Gets inbox items
-Get-TeamsChat`t`t`t-`t Downloads full Teams chat conversations
-    "
-    Write-Host -ForegroundColor green "-------------------- Teams Modules -------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Get-TeamsApps`t`t`t-`t This module enumerates all accessible Teams chat channel and grabs the URL for all installed apps in side each channel.
-Get-TeamsChannels`t`t-`t This module enumerates all accessible teams and the channels a user has access to. 
-Find-ChannelEmails`t`t-`t This module enumerates all accessible teams and the channels looking for any email addresses assoicated with them. 
-Get-ChannelUsersEnum`t`t-`t This module enumerates a defined channel to see how many people are in a channel and who they are.
-Get-ChannelEmail`t`t-`t This module enumerates a defined channel for an email address and sets the sender type to Anyone. If there is no email address create one and sets the sender type to Anyone.
-Get-Webhooks`t`t`t-`t This module enumerates all accessible channels looking for any webhooks and their configuration information, including its the url.
-Create-Webhook`t`t`t-`t This module creates a webhook in a defined channel and provides the URL.
-Send-TeamsMessage`t`t-`t This module sends a message using Microsoft Team's webhooks, without needing any authentication
-    "
-    Write-Host -ForegroundColor green "--------------------- GraphRunner Module ----------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Invoke-GraphRunner`t`t-`t Runs Invoke-GraphRecon, Get-AzureADUsers, Get-SecurityGroups, Invoke-DumpCAPS, Invoke-DumpApps, and then uses the default_detectors.json file to search with Invoke-SearchMailbox, Invoke-SearchSharePointAndOneDrive, and Invoke-SearchTeams."
+    Write-Host -ForegroundColor Green "-------------------- Authentication Modules -------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Get-GraphTokens`t`t`t-`t Authenticate as a user to Microsoft Graph"
+    Write-Host -ForegroundColor Green "Invoke-RefreshGraphTokens`t-`t Use a refresh token to obtain new access tokens"
+    Write-Host -ForegroundColor Green "Get-AzureAppTokens`t`t-`t Complete OAuth flow as an app to obtain access tokens"
+    Write-Host -ForegroundColor Green "Invoke-RefreshAzureAppTokens`t-`t Use a refresh token and app credentials to refresh a token"
+    Write-Host -ForegroundColor Green "Invoke-AutoTokenRefresh`t-`t Refresh tokens at an interval."
 
-    Write-Host -ForegroundColor green "-------------------- Supplemental Modules ---------------------"
-    Write-Host -ForegroundColor green "`tMODULE`t`t`t-`t DESCRIPTION"
-    Write-Host -ForegroundColor green "Invoke-DeleteOAuthApp`t`t-`t Delete an OAuth App
-Invoke-DeleteGroup`t`t-`t Delete a group
-Invoke-RemoveGroupMember`t-`t Module for removing users/members from groups
-Invoke-DriveFileDownload`t-`t Has the ability to download single files from as the current user.
-Invoke-CheckAccess`t`t-`t Check if tokens are valid
-Invoke-AutoOAuthFlow`t`t-`t Automates OAuth flow by standing up a web server and listening for auth code
-Invoke-HTTPServer`t`t-`t A basic web server to use for accessing the emailviewer that is output from Invoke-SearchMailbox
-Invoke-BruteClientIDAccess`t-`t Test different CLientID's against MSGraph to determine permissions
-Invoke-ImportTokens`t`t-`t Import tokens from other tools for use in GraphRunner
-Get-UserObjectID`t`t-`t Retrieves an object ID for a user
-    "
-    Write-Host -ForegroundColor green ("=" * 80)
-    Write-Host -ForegroundColor green '[*] For help with individual modules run Get-Help <module name> -detailed'
-    Write-Host -ForegroundColor green '[*] Example: Get-Help Invoke-InjectOAuthApp -detailed'
+    Write-Host -ForegroundColor Green "----------------- Recon & Enumeration Modules -----------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Invoke-GraphRecon`t`t-`t Performs general recon for org info, user settings, directory sync settings, etc"
+    Write-Host -ForegroundColor Green "Invoke-DumpCAPS`t`t`t-`t Gets conditional access policies"
+    Write-Host -ForegroundColor Green "Invoke-DumpApps`t`t`t-`t Gets app registrations and external enterprise apps along with consent and scope info"
+    Write-Host -ForegroundColor Green "Get-AzureADUsers`t`t-`t Gets user directory"
+    Write-Host -ForegroundColor Green "Get-SecurityGroups`t`t-`t Gets security groups and members"
+    Write-Host -ForegroundColor Green "Get-UpdatableGroups`t`t-`t Gets groups that may be able to be modified by the current user"
+    Write-Host -ForegroundColor Green "Get-DynamicGroups`t`t-`t Finds dynamic groups and displays membership rules"
+    Write-Host -ForegroundColor Green "Get-SharePointSiteURLs`t`t-`t Gets a list of SharePoint site URLs visible to the current user"
+    Write-Host -ForegroundColor Green "Invoke-GraphOpenInboxFinder`t-`t Checks each user's inbox in a list to see if they are readable"
+    Write-Host -ForegroundColor Green "Get-TenantID`t`t`t-`t Retrieves the tenant GUID from the domain name"
+
+    Write-Host -ForegroundColor Green "--------------------- Persistence Modules ---------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Invoke-InjectOAuthApp`t`t-`t Injects an app registration into the tenant"
+    Write-Host -ForegroundColor Green "Invoke-SecurityGroupCloner`t-`t Clones a security group while using an identical name and member list but can inject another user as well"
+    Write-Host -ForegroundColor Green "Invoke-InviteGuest`t`t-`t Invites a guest user to the tenant"
+    Write-Host -ForegroundColor Green "Invoke-AddGroupMember`t`t-`t Adds a member to a group"
+
+    Write-Host -ForegroundColor Green "----------------------- Pillage Modules -----------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Invoke-SearchSharePointAndOneDrive`t-`t Search across all SharePoint sites and OneDrive drives visible to the user"
+    Write-Host -ForegroundColor Green "Invoke-ImmersiveFileReader`t-`t Open restricted files with the immersive reader"
+    Write-Host -ForegroundColor Green "Invoke-SearchMailbox`t`t-`t Deep searches across a user's mailbox and can export messages"
+    Write-Host -ForegroundColor Green "Invoke-SearchTeams`t`t-`t Search all Teams messages in all channels that are readable by the current user"
+    Write-Host -ForegroundColor Green "Invoke-SearchUserAttributes`t-`t Search for terms across all user attributes in a directory"
+    Write-Host -ForegroundColor Green "Get-Inbox`t`t`t-`t Gets inbox items"
+    Write-Host -ForegroundColor Green "Get-TeamsChat`t`t`t-`t Downloads full Teams chat conversations"
+
+    Write-Host -ForegroundColor Green "-------------------- Teams Modules ----------------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Get-TeamsApps`t`t`t-`t Enumerates Teams chat channels and grabs URLs of installed apps"
+    Write-Host -ForegroundColor Green "Get-TeamsChannels`t`t-`t Enumerates all accessible teams and channels"
+    Write-Host -ForegroundColor Green "Find-ChannelEmails`t`t-`t Looks for any email addresses associated with teams/channels"
+    Write-Host -ForegroundColor Green "Get-ChannelUsersEnum`t`t-`t Enumerates a channel's user list"
+    Write-Host -ForegroundColor Green "Get-ChannelEmail`t`t-`t Checks/creates a channel email address and sets sender permissions"
+    Write-Host -ForegroundColor Green "Get-Webhooks`t`t`t-`t Finds webhooks in channels and their configurations"
+    Write-Host -ForegroundColor Green "Create-Webhook`t`t`t-`t Creates a webhook in a channel and provides the URL"
+    Write-Host -ForegroundColor Green "Send-TeamsMessage`t`t-`t Sends a message via Teams webhook (no auth required)"
+
+    Write-Host -ForegroundColor Green "--------------------- GraphRunner Module ----------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Invoke-GraphRunner`t`t-`t Runs multiple recon and pillage modules and searches using default_detectors.json"
+
+    Write-Host -ForegroundColor Green "-------------------- Supplemental Modules ---------------------"
+    Write-Host -ForegroundColor Green "`tMODULE`t`t`t-`t DESCRIPTION"
+    Write-Host -ForegroundColor Green "Invoke-DeleteOAuthApp`t`t-`t Delete an OAuth App"
+    Write-Host -ForegroundColor Green "Invoke-DeleteGroup`t`t-`t Delete a group"
+    Write-Host -ForegroundColor Green "Invoke-RemoveGroupMember`t-`t Remove users/members from groups"
+    Write-Host -ForegroundColor Green "Invoke-DriveFileDownload`t-`t Download single files as the current user"
+    Write-Host -ForegroundColor Green "Invoke-CheckAccess`t`t-`t Check if tokens are valid"
+    Write-Host -ForegroundColor Green "Invoke-AutoOAuthFlow`t`t-`t Automates OAuth flow via local web server"
+    Write-Host -ForegroundColor Green "Invoke-HTTPServer`t`t-`t Basic web server for viewing SearchMailbox output"
+    Write-Host -ForegroundColor Green "Invoke-BruteClientIDAccess`t-`t Tests various ClientIDs against MS Graph"
+    Write-Host -ForegroundColor Green "Invoke-ImportTokens`t`t-`t Import tokens from other tools into GraphRunner"
+    Write-Host -ForegroundColor Green "Get-UserObjectID`t`t-`t Retrieves a user's object ID"
+
+    Write-Host -ForegroundColor Green ("=" * 80)
+    Write-Host -ForegroundColor Green '[*] For help with individual modules run Get-Help <module name> -Detailed'
+    Write-Host -ForegroundColor Green '[*] Example: Get-Help Invoke-InjectOAuthApp -Detailed'
 }
