@@ -7678,6 +7678,7 @@ function Invoke-BruteClientIDAccess {
         Write-Host -ForegroundColor $OutputColor "App: $($_.App) ClientID: $($_.ClientID) has scope of: $($CustomToken.scope)"
     }
 }
+
 function Invoke-ImportTokens {
     [cmdletbinding()]
     Param([Parameter(Mandatory=$false)]
@@ -7689,25 +7690,6 @@ function Invoke-ImportTokens {
     $global:tokens = @(
         [pscustomobject]@{access_token=$AccessToken;refresh_token=$RefreshToken}
     )
-}
-
-# Function to generate code verifier and challenge for PKCE
-function New-PKCEParameters {
-    # Generate code verifier (43-128 characters, URL-safe)
-    $bytes = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $rng.GetBytes($bytes)
-    $code_verifier = [Convert]::ToBase64String($bytes) -replace '\+', '-' -replace '/', '_' -replace '=', ''
-    
-    # Generate code challenge (SHA256 hash of verifier, base64url encoded)
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    $challenge_bytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($code_verifier))
-    $code_challenge = [Convert]::ToBase64String($challenge_bytes) -replace '\+', '-' -replace '/', '_' -replace '=', ''
-    
-    return @{
-        code_verifier = $code_verifier
-        code_challenge = $code_challenge
-    }
 }
 
 function Invoke-AuthorizationCodeFlow {
@@ -7835,89 +7817,6 @@ function Start-LocalHttpListener {
     Write-Host "Started local HTTP listener on http://localhost:$port" -ForegroundColor Yellow
 
     return $listener, $port
-}
-
-# Function to wait for authorization code from redirect
-function Wait-ForAuthorizationCode {
-    param([System.Net.HttpListener]$listener)
-    
-    Write-Host "Waiting for authorization code..." -ForegroundColor Yellow
-
-    while($listener.IsListening) {
-        try {
-            $context = $listener.GetContext()
-            $request = $context.Request
-            $response = $context.Response
-
-            # Extract authorization code from query parameters
-            $query = $request.Url.Query
-            if ($query -match 'code=([^&]+)') {
-                return $matches[1]
-            } elseif ($query -match 'error=([^&]+)') {
-                $error = $matches[1]
-                $errorDescription = if ($query -match 'error_description=([^&]+)') { [System.Web.HttpUtility]::UrlDecode($matches[1]) } else { "Unknown error" }
-                throw "Authentication error: $error - $errorDescription"
-            } else {
-                throw "No authorization code received"
-            }
-
-            # Send response to browser
-            $responseString = @"
-                <html>
-                <body>
-                <h2>Authentication Complete</h2>
-                <p>You can close this window and return to PowerShell.</p>
-                </body>
-                </html>
-"@
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes($responseString)
-            $response.ContentLength64 = $buffer.Length
-            $output = $response.OutputStream
-            $output.Write($buffer, 0, $buffer.Length)
-            $output.Close()
-            $response.Close()
-
-            $listener.Stop()
-        } catch {
-            Write-Host "Error handling request: $($_.Exception.Message)" -ForegroundColor Red
-        }
-    }
-}
-
-# Function to exchange authorization code for access token
-function Get-AccessTokenFromCode {
-    param(
-        [string]$authorization_code,
-        [string]$code_verifier,
-        [string]$tenant_id,
-        [string]$client_id,
-        [string]$redirect_uri
-    )
-    
-    $tokenEndpoint = "https://login.microsoftonline.com/$tenant_id/oauth2/v2.0/token"
-    
-    $body = @{
-        client_id = "$client_id"
-        scope = $Scope
-        code = $authorization_code
-        redirect_uri = $redirect_uri
-        grant_type = "authorization_code"
-        code_verifier = $code_verifier
-    }
-    
-    try {
-        Write-Host "Exchanging authorization code for access token..." -ForegroundColor Yellow
-        $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
-        return $response
-    } catch {
-        Write-Error "Failed to exchange authorization code: $($_.Exception.Message)"
-        if ($_.Exception.Response) {
-            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-            $errorBody = $reader.ReadToEnd()
-            Write-Error "Error details: $errorBody"
-        }
-        throw
-    }
 }
 
 function List-GraphRunnerModules{
