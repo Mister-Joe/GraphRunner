@@ -7772,21 +7772,6 @@ function Invoke-AuthorizationCodeFlow {
     }
 }
 
-# Function to start local HTTP listener for redirect
-function Start-LocalHttpListener {
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("http://localhost:0/")
-    $listener.Start()
-
-    # Extract the assigned port
-    $uri = $httpListener.Prefixes | Select-Object -First 1
-    $port = ([System.Uri]$uri).Port
-
-    Write-Host "Started local HTTP listener on http://localhost:$port" -ForegroundColor Yellow
-
-    return $listener, $port
-}
-
 function Invoke-BruteClientIDAccess {
 
     [cmdletbinding()]
